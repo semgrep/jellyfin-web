@@ -195,6 +195,15 @@ export default tseslint.config(
         }
     },
 
+    // Node-only dev/test tooling: not shipped to a browser, so the
+    // browser-target compat check doesn't apply
+    {
+        files: [ 'scripts/repro/**/*.mjs' ],
+        rules: {
+            'compat/compat': 'off'
+        }
+    },
+
     // App files
     {
         files: [

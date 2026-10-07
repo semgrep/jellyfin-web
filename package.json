@@ -54,6 +54,7 @@
     "postcss-loader": "8.2.1",
     "postcss-preset-env": "10.6.1",
     "postcss-scss": "4.0.9",
+    "puppeteer": "25.12.0",
     "sass": "1.102.0",
     "sass-loader": "16.0.8",
     "source-map-loader": "5.0.0",
@@ -169,7 +170,8 @@
     "lint": "eslint",
     "test": "vitest --watch=false --config vite.config.ts",
     "test:watch": "vitest --config vite.config.ts",
-    "stylelint": "stylelint \"src/**/*.{css,scss}\""
+    "stylelint": "stylelint \"src/**/*.{css,scss}\"",
+    "repro:device-name-render": "node scripts/repro/device-name-render.mjs"
   },
   "engines": {
     "node": ">=24.0.0",
