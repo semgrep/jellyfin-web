@@ -1,3 +1,4 @@
+import escapeHtml from 'escape-html';
 import { AppFeature } from 'constants/appFeature';
 import Events from '../../utils/events.ts';
 import browser from '../../scripts/browser';
@@ -182,11 +183,19 @@ function showActivePlayerMenuInternal(playerInfo) {
 
     dlg.classList.add('promptDialog');
 
+    // playerInfo.deviceName/name round-trips from the server's session/device
+    // record (Jellyfin.Server.Implementations.Security.AuthorizationContext
+    // persists it verbatim from the caller-supplied Device header), so it
+    // carries no guarantee of being plain text by the time it reaches this
+    // client. Escape it the same way the sibling target-picker dialog in
+    // actionSheet.ts already escapes the identical field before building
+    // markup from it.
     const currentDeviceName = (playerInfo.deviceName || playerInfo.name);
+    const displayDeviceName = escapeHtml(currentDeviceName);
 
     html += '<div class="promptDialogContent" style="padding:1.5em;">';
     html += '<h2 style="margin-top:.5em;">';
-    html += currentDeviceName;
+    html += displayDeviceName;
     html += '</h2>';
 
     html += '<div>';
