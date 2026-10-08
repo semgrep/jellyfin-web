@@ -14,35 +14,46 @@
  * (components/playback/playerSelectionMenu.js) did not, and built that
  * dialog's markup by string concatenation instead.
  *
+ * The fix and this script live on the same branch/commit, so simply
+ * running the checked-out code only ever shows the fixed behavior. To
+ * actually demonstrate the issue being fixed, this script finds the commit
+ * that added the escaping (by content, not a hardcoded hash) and builds
+ * its parent commit's source as well, so it can show both states side by
+ * side:
+ *
+ *   pass 1: the code as it looked before the fix -- a dialog box appears
+ *   pass 2: the current branch, with the fix applied -- no dialog appears
+ *
  * This script never talks to a real Jellyfin server or network. It starts
  * a local HTTP server implementing just the handful of read-only endpoints
  * this client calls while signing in and opening the cast menu, seeds one
  * fake remote session whose device name is a short, inert HTML snippet,
- * and drives a real, visible browser through:
+ * and drives a real, visible browser through, for each pass:
  *
  *   1. sign in
  *   2. open the cast menu       (the picker: the seeded name shows as plain
  *                                 text here -- this dialog is unaffected)
  *   3. select the seeded target (ordinary client-side state, no network)
- *   4. reopen the cast menu     (the dialog this fix changes)
+ *   4. reopen the cast menu     (the dialog the fix changes)
  *
- * Before the fix, step 4 renders the seeded string as markup and a native
- * dialog box appears; after the fix, the same string displays as plain
- * text and no dialog appears. Either way the script finishes on its own.
+ * Each step pauses briefly so a person watching the browser window can
+ * follow along. Either way, each pass finishes on its own.
  *
  * Usage:
  *   npm run repro:device-name-render
  *   (or: node scripts/repro/device-name-render.mjs)
  *
  * No arguments. No account. No existing server. The only interaction this
- * script asks of you is dismissing that dialog box if it appears -- click
- * OK to close it and let the script finish.
+ * script asks of you is dismissing the dialog box in pass 1 -- click OK to
+ * close it and let the script continue.
  */
 
 import { createServer } from 'node:http';
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, cp } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -53,8 +64,10 @@ const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 const DIST_DIR = path.join(REPO_ROOT, 'dist');
+const FIX_FILE = 'src/components/playback/playerSelectionMenu.js';
 const PORT = 18096;
 const BASE_URL = `http://127.0.0.1:${PORT}`;
+const STEP_PAUSE_MS = 900;
 
 const SERVER_ID = 'repro0000000000000000000000000000';
 const USER_ID = 'repro-user-0000000000000000000000';
@@ -90,6 +103,65 @@ const MIME_TYPES = {
 
 function log(msg) {
     console.log(`[repro] ${msg}`);
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// A short, visible pause after a step so a person watching the browser
+// window can see what just happened before the next action fires.
+function pause() {
+    return sleep(STEP_PAUSE_MS);
+}
+
+async function git(args) {
+    const { stdout } = await execFileAsync('git', args, { cwd: REPO_ROOT });
+    return stdout.trim();
+}
+
+// Finds the commit that added the escaping, by content rather than a
+// hardcoded hash, so this keeps working across rebases/squashes. Since this
+// script and the fix always land in the same change, this commit is always
+// reachable from HEAD.
+async function resolveFixCommit() {
+    const gitLogOutput = await git(['log', '-S', 'escapeHtml', '--format=%H', '--', FIX_FILE]);
+    const commits = gitLogOutput.split('\n').filter(Boolean);
+    if (!commits.length) {
+        throw new Error(`could not find the commit that added escaping to ${FIX_FILE}`);
+    }
+    const fixCommit = commits[0];
+    const parentCommit = await git(['rev-parse', `${fixCommit}~1`]);
+    return { fixCommit, parentCommit };
+}
+
+// Builds the web client as it looked at `commit`, in an isolated git
+// worktree (so the current checkout is never touched), and caches the
+// result by commit hash so repeat runs don't rebuild it.
+async function ensureHistoricalDist(commit) {
+    const cacheDir = path.join(os.tmpdir(), `jellyfin-web-repro-dist-${commit}`);
+    if (existsSync(path.join(cacheDir, 'index.html'))) {
+        log(`reusing cached build of ${commit.slice(0, 12)} at ${cacheDir}`);
+        return cacheDir;
+    }
+
+    log(`building the code as it looked at ${commit.slice(0, 12)} -- this can take a minute`);
+    const worktreeDir = path.join(os.tmpdir(), `jellyfin-web-repro-src-${randomUUID()}`);
+    await execFileAsync('git', ['worktree', 'add', '--detach', worktreeDir, commit], { cwd: REPO_ROOT });
+    try {
+        // Reuse the already-installed toolchain instead of a second `npm
+        // install`; nothing about node_modules differs between these two
+        // commits, only this one source file does.
+        await execFileAsync('ln', ['-s', path.join(REPO_ROOT, 'node_modules'), path.join(worktreeDir, 'node_modules')]);
+        await execFileAsync('npm', ['run', 'build:production'], {
+            cwd: worktreeDir,
+            env: { ...process.env, NODE_ENV: 'production' }
+        });
+        await cp(path.join(worktreeDir, 'dist'), cacheDir, { recursive: true });
+        return cacheDir;
+    } finally {
+        await execFileAsync('git', ['worktree', 'remove', '--force', worktreeDir], { cwd: REPO_ROOT }).catch(() => undefined);
+    }
 }
 
 async function ensureBuilt() {
@@ -269,10 +341,10 @@ async function handleApi(req, res, pathname) {
     res.end();
 }
 
-async function serveStatic(req, res, pathname) {
+async function serveStatic(req, res, pathname, distDir) {
     let filePath = pathname === '/' ? '/index.html' : pathname;
-    filePath = path.join(DIST_DIR, decodeURIComponent(filePath));
-    if (!filePath.startsWith(DIST_DIR)) {
+    filePath = path.join(distDir, decodeURIComponent(filePath));
+    if (!filePath.startsWith(distDir)) {
         res.writeHead(403);
         return res.end();
     }
@@ -290,18 +362,18 @@ async function serveStatic(req, res, pathname) {
         res.writeHead(200, { 'Content-Type': MIME_TYPES[ext] || 'application/octet-stream' });
         res.end(data);
     } catch {
-        const index = await readFile(path.join(DIST_DIR, 'index.html'));
+        const index = await readFile(path.join(distDir, 'index.html'));
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(index);
     }
 }
 
-async function startServer() {
+async function startServer(distDir) {
     const server = createServer(async (req, res) => {
         try {
             const url = new URL(req.url, BASE_URL);
             if (url.pathname.startsWith('/web/') || url.pathname === '/web') {
-                return await serveStatic(req, res, url.pathname.replace(/^\/web/, '') || '/index.html');
+                return await serveStatic(req, res, url.pathname.replace(/^\/web/, '') || '/index.html', distDir);
             }
             if (
                 [
@@ -310,7 +382,7 @@ async function startServer() {
             ) {
                 return await handleApi(req, res, url.pathname);
             }
-            return await serveStatic(req, res, url.pathname);
+            return await serveStatic(req, res, url.pathname, distDir);
         } catch (err) {
             res.writeHead(500);
             res.end(String(err));
@@ -325,7 +397,6 @@ async function startServer() {
     });
 
     await new Promise((resolve) => server.listen(PORT, '127.0.0.1', resolve));
-    log(`fixture server listening on ${BASE_URL}`);
     return server;
 }
 
@@ -346,21 +417,26 @@ async function launchBrowser() {
     }
 }
 
-async function main() {
-    await ensureBuilt();
-    const server = await startServer();
+const domClick = (page, sel) => page.evaluate((s) => document.querySelector(s)?.click(), sel);
 
-    const browser = await launchBrowser();
-
+// Drives one sign-in -> open cast menu -> pick target -> reopen cast menu
+// pass against whichever build the caller already pointed the fixture
+// server at, pausing briefly after each step so a person watching the
+// browser window can follow along.
+async function runScenario(browser) {
+    // A fresh context per pass, so pass 2 doesn't inherit pass 1's
+    // localStorage (saved server/session state), which would otherwise
+    // skip straight past the manual-login form.
+    const context = await browser.createBrowserContext();
+    const page = await context.newPage();
     try {
-        const page = await browser.newPage();
         await page.setViewport({ width: 1200, height: 800 });
 
         let dialogSeen = false;
         page.on('dialog', (dialog) => {
             dialogSeen = true;
             log(`a dialog box opened: ${JSON.stringify(dialog.message())}`);
-            log('dismiss it (click OK) to let the script finish.');
+            log('dismiss it (click OK) to continue.');
             // Deliberately not calling dialog.dismiss()/accept() here: this
             // is a real, visible browser window, and letting a real person
             // close the dialog is the point.
@@ -368,6 +444,8 @@ async function main() {
 
         log(`opening ${BASE_URL}/web/ in a visible browser window`);
         await page.goto(`${BASE_URL}/web/`, { waitUntil: 'networkidle2', timeout: 30000 });
+        await pause();
+
         await page.waitForSelector('#txtManualName', { visible: true, timeout: 15000 }).catch(() => undefined);
         const manualBtn = await page.$('.btnManual');
         if (manualBtn) {
@@ -377,14 +455,14 @@ async function main() {
         await page.waitForSelector('#txtManualName', { visible: true, timeout: 15000 });
         await page.type('#txtManualName', USER_NAME, { delay: 15 });
         await page.type('#txtManualPassword', PASSWORD, { delay: 15 });
+        await pause();
 
         log('signing in');
         await Promise.all([
             page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 20000 }).catch(() => undefined),
             page.click('.manualLoginForm .button-submit')
         ]);
-
-        const domClick = (sel) => page.evaluate((s) => document.querySelector(s)?.click(), sel);
+        await pause();
 
         await page.waitForFunction(
             (sel) => {
@@ -396,8 +474,9 @@ async function main() {
         );
 
         log('opening the cast menu (target picker -- unaffected by this fix, renders as text here)');
-        await domClick('.headerCastButton');
+        await domClick(page, '.headerCastButton');
         await page.waitForSelector('.actionSheetMenuItem', { timeout: 10000 });
+        await pause();
 
         const selected = await page.evaluate(() => {
             const el = Array.from(document.querySelectorAll('.actionSheetMenuItem'))
@@ -411,26 +490,68 @@ async function main() {
         if (!selected) {
             throw new Error('seeded target did not appear in the cast menu');
         }
-        await new Promise((r) => setTimeout(r, 1000));
+        await pause();
 
         log('reopening the cast menu (this is the dialog the fix changes)');
-        await domClick('.headerCastButton');
-        await new Promise((r) => setTimeout(r, 1500));
+        await domClick(page, '.headerCastButton');
+        await pause();
 
         if (dialogSeen) {
-            log('RESULT: a dialog box opened -- the device name rendered as markup (pre-fix behavior).');
-            log('Waiting for you to dismiss it...');
+            log('waiting for you to dismiss the dialog...');
             await page.waitForFunction(() => true, { timeout: 60000 }).catch(() => undefined);
             // Give puppeteer a moment to notice the dialog actually closed.
-            await new Promise((r) => setTimeout(r, 500));
+            await sleep(500);
+            return { dialogSeen: true, text: null };
+        }
+        const text = await page.evaluate(() => document.querySelector('.promptDialogContent h2')?.textContent);
+        await pause();
+        return { dialogSeen: false, text };
+    } finally {
+        await page.close();
+        await context.close();
+    }
+}
+
+async function main() {
+    const { fixCommit, parentCommit } = await resolveFixCommit();
+    log(`found the fix at ${fixCommit.slice(0, 12)}; its parent is ${parentCommit.slice(0, 12)}`);
+
+    const preFixDist = await ensureHistoricalDist(parentCommit);
+    await ensureBuilt();
+
+    const browser = await launchBrowser();
+    try {
+        log('=== pass 1/2: the code as it looked before this fix ===');
+        const serverA = await startServer(preFixDist);
+        let resultA;
+        try {
+            resultA = await runScenario(browser);
+        } finally {
+            serverA.close();
+        }
+        if (resultA.dialogSeen) {
+            log('RESULT: a dialog box opened -- the device name rendered as markup (this is the issue the fix addresses).');
         } else {
-            const text = await page.evaluate(() => document.querySelector('.promptDialogContent h2')?.textContent);
-            log(`RESULT: no dialog box opened -- the device name displayed as plain text: ${JSON.stringify(text)}`);
+            log('RESULT: unexpected -- no dialog opened against the pre-fix build.');
+        }
+        await pause();
+
+        log('=== pass 2/2: the current branch, with the fix applied ===');
+        const serverB = await startServer(DIST_DIR);
+        let resultB;
+        try {
+            resultB = await runScenario(browser);
+        } finally {
+            serverB.close();
+        }
+        if (!resultB.dialogSeen) {
+            log(`RESULT: no dialog opened -- the device name displayed as plain text: ${JSON.stringify(resultB.text)}`);
             log('(this is the fixed behavior)');
+        } else {
+            log('RESULT: unexpected -- a dialog still opened against the current build.');
         }
     } finally {
         await browser.close();
-        server.close();
     }
 }
 
